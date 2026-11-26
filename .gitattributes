@@ -1,0 +1,15 @@
+* text=auto eol=lf
+
+*.pdf binary
+*.png binary
+*.jpg binary
+*.elf binary
+*.bin binary
+*.hex binary
+
+*.md text diff=markdown
+*.c text diff=c
+*.h text diff=c
+*.ini text
+*.json text
+*.yml text
