@@ -10,6 +10,7 @@
 #include "stm32f4xx_hal.h"
 
 #include "bsp_capture.h"
+#include "bsp_sdio.h"
 
 /* Фронт INT1 (PB5) и конец приёма FIFO по DMA — единственные данные, которые
    прерывания передают главному циклу. Сбрасывает их main.c. */
@@ -75,6 +76,28 @@ void DMA2_Stream0_IRQHandler(void)
    Пока NVIC этих периферий не включён, обработчики не вызываются. Если шум
    или случайный флаговый сброс поднимет прерывание, вектор не должен уйти в
    .weak бесконечный цикл startup: флаги снимаются, выход. */
+
+/**
+ * SDIO (запись/чтение блоков MicroSD). Диспетчер HAL обязателен: именно
+ * HAL_SD_IRQHandler() доводит конечный автомат до HAL_SD_STATE_READY и
+ * останавливает DMA SDIO. Обработчик, который только снимает флаги, оставил бы
+ * hsd->State == BUSY навсегда, и каждая следующая запись вернула бы HAL_BUSY.
+ * HAL сам снимает флаги SDIO (SDIO_ICR / DICLR) и читает STAT/SR при ошибках.
+ */
+void SDIO_IRQHandler(void)
+{
+    HAL_SD_IRQHandler(bsp_sdio_handle());
+}
+
+/**
+ * DMA2 Stream 6 = SDIO (Docs/03 §1). HAL_DMA_IRQHandler() снимает флаги
+ * LIFCR/HIFCR потока и вызывает колбэки SD_DMATransmitCplt / SD_DMAError,
+ * которые дальше работают через HAL_SD_IRQHandler.
+ */
+void DMA2_Stream6_IRQHandler(void)
+{
+    HAL_DMA_IRQHandler(bsp_sdio_dma_handle());
+}
 
 void TIM2_IRQHandler(void)
 {

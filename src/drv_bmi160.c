@@ -22,6 +22,8 @@
 
 /* Регистры FIFO/прерываний (Docs/02_bmi160_ref.md раздел 2) */
 #define BMI160_REG_PMU_STATUS 0x03u
+#define BMI160_REG_FIFO_LENGTH_0 0x22u
+#define BMI160_REG_FIFO_LENGTH_1 0x23u
 #define BMI160_REG_ACC_CONF 0x40u
 #define BMI160_REG_ACC_RANGE 0x41u
 #define BMI160_REG_FIFO_CONFIG_0 0x46u
@@ -35,6 +37,9 @@
 /* PMU_STATUS (0x03): acc_pmu_status = биты [5:4], Normal == 01 (Docs/02 §2) */
 #define BMI160_PMU_ACC_STATUS_MASK 0x30u
 #define BMI160_PMU_ACC_STATUS_NORMAL 0x10u
+
+/* FIFO_LENGTH_1 (0x23): fifo_byte_counter[10:8], маска 0x07 (Docs/02 §2) */
+#define BMI160_FIFO_LENGTH_HI_MASK 0x07u
 
 /* Значения профиля 1600 Гц / +/-16 g (Docs/02_bmi160_ref.md раздел 3) */
 #define BMI160_ACC_CONF_VALUE 0x1Cu    /* acc_bwp = OSR2 (-3 дБ на 324 Гц), acc_odr = 1600 Гц */
@@ -237,6 +242,26 @@ bool drv_bmi160_configure_fifo(void)
     HAL_Delay(BMI160_FIFO_FLUSH_SETTLE_MS);
 
     return true;
+}
+
+uint16_t drv_bmi160_get_fifo_length(void)
+{
+    uint8_t len0 = 0u;
+    uint8_t len1 = 0u;
+
+    /* Автоинкремент адреса включён всегда, кроме 0x24 (Docs/02 §1):
+       один цикл CS = 0 -> 0x80|0x22 -> FIFO_LENGTH_0 -> FIFO_LENGTH_1. */
+    bmi160_cs_low();
+    if (!bmi160_xfer(BMI160_ADDR_READ | BMI160_REG_FIFO_LENGTH_0, NULL) ||
+        !bmi160_xfer(0xFFu, &len0) ||
+        !bmi160_xfer(0xFFu, &len1)) {
+        bmi160_cs_high();
+        return BMI160_FIFO_LENGTH_SPI_ERROR;
+    }
+    bmi160_cs_high();
+
+    /* fifo_byte_counter[10:0]: младшие 8 байт + 3 старших бита (Docs/02 §2) */
+    return (uint16_t)len0 | (uint16_t)((uint16_t)(len1 & BMI160_FIFO_LENGTH_HI_MASK) << 8);
 }
 
 SPI_HandleTypeDef *drv_bmi160_spi_handle(void)

@@ -29,6 +29,12 @@ extern "C" {
 /** Потолок одной DMA-вычитки: 252 = 36 * 7 байт (Docs/02 §4 п.4). */
 #define BSP_CAPTURE_MAX_LEN 252u
 
+/** Байт в regular-фрейме BMI160: 1 заголовок + 6 данных (Docs/02 §4). */
+#define BSP_CAPTURE_FRAME_BYTES 7u
+
+/** FIFO почти полон: >= 1015 байт -> SENSOR_OVR (Docs/02 §4 п.3). */
+#define BSP_CAPTURE_FIFO_OVR_BYTES 1015u
+
 /**
  * Инициализация DMA2 Stream 0 (SPI1_RX) и Stream 3 (SPI1_TX) + NVIC для
  * Stream 0 (прерывание Transfer Complete). Сбой HAL_DMA_Init() увеличивает

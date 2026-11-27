@@ -32,6 +32,16 @@ extern "C" {
  */
 #define BMI160_FIFO_WATERMARK_BYTES 56u
 
+/** Максимальное содержимое FIFO датчика, байт (Docs/02 §2: 1024). */
+#define BMI160_FIFO_LENGTH_MAX 1024u
+
+/**
+ * Значение drv_bmi160_get_fifo_length() при сбое SPI1: 0xFFFF заведомо больше
+ * любого реального счётчика FIFO (максимум 1024), поэтому вызывающий обязан
+ * отличить его от штатного состояния.
+ */
+#define BMI160_FIFO_LENGTH_SPI_ERROR 0xFFFFu
+
 /**
  * Настроить SPI1 и пины датчика: Mode 3 (CPOL=1, CPHA=1), MSB first,
  * 5.25 МГц (APB2 84 МГц / 16), CS (PA4) — push-pull, активный LOW
@@ -81,6 +91,15 @@ bool drv_bmi160_start_accel(void);
  * false — сбой SPI1, вызывающий обязан уйти в код ошибки.
  */
 bool drv_bmi160_configure_fifo(void);
+
+/**
+ * Прочитать счётчик содержимого FIFO: FIFO_LENGTH_0 (0x22) + FIFO_LENGTH_1 (0x23)
+ * одним циклом CS = 0 (автоинкремент адреса, Docs/02 §1), как требует Docs/02 §4 п.2:
+ *   fifo_bytes = len0 | ((len1 & 0x07) << 8)
+ * 0 — FIFO пуст (ничего не вычитывать); 1015..1024 — FIFO почти полный, риск
+ * переполнения (SENSOR_OVR); BMI160_FIFO_LENGTH_SPI_ERROR (0xFFFF) — сбой SPI1.
+ */
+uint16_t drv_bmi160_get_fifo_length(void);
 
 /**
  * Ручка SPI1 наружу: этапам вычитки FIFO (bsp_capture) нужна сама шина,
