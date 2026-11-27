@@ -56,6 +56,24 @@ void bsp_sdio_transfer_begin(void);
  */
 bool bsp_sdio_wait_transfer(uint32_t timeout_ms);
 
+/**
+ * Срыв транзакции и восстановление DMA-обвязки: HAL_SD_Abort() + повторный
+ * HAL_SD_MspInit() (Docs/03 §2). Вызывать после ЛЮБОГО сбоя DMA-транзакции:
+ * сам HAL_SD_Abort() состояние DMA-потока не восстанавливает, и без этого
+ * следующая транзакция вернёт HAL_ERROR навсегда. Сброс флагов done/error
+ * выполняется внутри.
+ * true — поток перепривязан; false — HAL_DMA_Init() не удалось (SDIO готово
+ * к повторной bsp_sdio_init(), но не к транзакциям).
+ */
+bool bsp_sdio_abort_recover(void);
+
+/**
+ * L1 (Docs/03 §2): полный перезапуск инициализации SDIO/карты после исчерпания
+ * повторов записи. Обходит идемпотентный guard bsp_sdio_init(), поэтому
+ * вызов bsp_sdio_init() «напрямую» после сбоя ничего не делает.
+ */
+void bsp_sdio_reinit(void);
+
 #ifdef __cplusplus
 }
 #endif

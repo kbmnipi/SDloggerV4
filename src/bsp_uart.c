@@ -16,7 +16,6 @@
 #include "bsp_uart.h"
 
 #include <stdarg.h>
-#include <stdio.h>
 
 /* PA9 = TX, PA10 = RX, AF7 (Docs/01 §2) */
 #define UART_INSTANCE USART1
@@ -110,6 +109,162 @@ uint32_t bsp_uart_error_count(void)
     return g_uart_error_count;
 }
 
+/* ===========================================================================
+ * Минимальный форматтер вместо vsnprintf() (аудит M1, находка K2).
+ *
+ * vsnprintf() из newlib-nano тянет в образ цепочку _svfprintf_r -> _malloc_r
+ * -> _sbrk (подтверждено firmware.map до правки): куча при _Min_Heap_Size = 0
+ * выросла бы от _end прямо в резерв стека MSP. Свой форматтер не аллоцирует
+ * ничего и пишется строго в g_uart_buf.
+ *
+ * Поддерживается ровно то, что нужно логу: %s, %c, %d, %u, %x, %X, %% и
+ * опциональные заполнитель/ширина ("%02X"). Модификаторы длины, '+'/'-',
+ * точность и float НЕ поддерживаются: неизвестная спецификация печатается
+ * дословно (сбой виден в логе), а не съедает аргумент молча.
+ *
+ * Все write-функции принимают счётчик n: он всегда растёт, а в buf попадает
+ * только первые keep байт. На выходе n — длина строки БЕЗ учёта обрезки,
+ * поэтому обрезка обнаруживается сравнением n c размером буфера.
+ * =========================================================================== */
+
+/* 32-битное беззнаковое в десятичном: максимум 10 цифр + запас */
+#define UART_FMT_MAX_DIGITS 11u
+
+static void uart_fmt_putc(uint32_t *n, char *buf, uint32_t keep, char ch)
+{
+    if (*n < keep) {
+        buf[*n] = ch;
+    }
+    (*n)++;
+}
+
+static void uart_fmt_puts(uint32_t *n, char *buf, uint32_t keep, const char *s)
+{
+    if (s == NULL) {
+        s = "(null)";
+    }
+    while (*s != '\0') {
+        uart_fmt_putc(n, buf, keep, *s++);
+    }
+}
+
+static void uart_fmt_putu(uint32_t *n, char *buf, uint32_t keep, uint32_t value, uint32_t base,
+                          bool upper, char pad, uint32_t width)
+{
+    char tmp[UART_FMT_MAX_DIGITS];
+    uint32_t num = 0u;
+
+    /* цифры пишем от младшего разряда, выводим в обратном порядке */
+    do {
+        uint32_t rem = value % base;
+
+        value /= base;
+        if (rem < 10u) {
+            tmp[num] = (char)('0' + (int)rem);
+        } else {
+            tmp[num] = upper ? (char)('A' + (int)(rem - 10u)) : (char)('a' + (int)(rem - 10u));
+        }
+        num++;
+    } while (value != 0u);
+
+    while (num < width) {
+        tmp[num] = pad;
+        num++;
+    }
+
+    while (num > 0u) {
+        num--;
+        uart_fmt_putc(n, buf, keep, tmp[num]);
+    }
+}
+
+static void uart_fmt_puti(uint32_t *n, char *buf, uint32_t keep, int32_t value, char pad,
+                          uint32_t width)
+{
+    if (value < 0) {
+        uart_fmt_putc(n, buf, keep, '-');
+        if (width > 0u) {
+            width--;
+        }
+        /* (uint32_t)0 - (uint32_t)value: вычитание беззнаковое, потому что
+           -(-2147483648) не представимо в int32_t (UB знаковое) */
+        uart_fmt_putu(n, buf, keep, (uint32_t)0u - (uint32_t)value, 10u, false, pad, width);
+    } else {
+        uart_fmt_putu(n, buf, keep, (uint32_t)value, 10u, false, pad, width);
+    }
+}
+
+static uint32_t uart_fmt(char *buf, uint32_t cap, const char *format, va_list args)
+{
+    uint32_t n = 0u;
+    uint32_t keep = cap - 1u; /* последний байт всегда под терминирующий '\0' */
+
+    while (*format != '\0') {
+        char fmt = *format++;
+        char pad = ' ';
+        uint32_t width = 0u;
+
+        if (fmt != '%') {
+            uart_fmt_putc(&n, buf, keep, fmt);
+            continue;
+        }
+
+        fmt = *format++;
+        if (fmt == '\0') {
+            break;
+        }
+        if (fmt == '%') {
+            uart_fmt_putc(&n, buf, keep, '%');
+            continue;
+        }
+
+        /* необязательные '0' и цифры ширины: %02X -> pad='0', width=2 */
+        while ((fmt == '0') || ((fmt >= '1') && (fmt <= '9'))) {
+            if (fmt == '0') {
+                pad = '0';
+            }
+            if (width < 99u) {
+                width = (width * 10u) + (uint32_t)(fmt - '0');
+            }
+            fmt = *format++;
+            if (fmt == '\0') {
+                break;
+            }
+        }
+        if (fmt == '\0') {
+            break;
+        }
+
+        switch (fmt) {
+        case 's':
+            uart_fmt_puts(&n, buf, keep, va_arg(args, const char *));
+            break;
+        case 'c':
+            uart_fmt_putc(&n, buf, keep, (char)va_arg(args, int));
+            break;
+        case 'd':
+            uart_fmt_puti(&n, buf, keep, (int32_t)va_arg(args, int), pad, width);
+            break;
+        case 'u':
+            uart_fmt_putu(&n, buf, keep, va_arg(args, unsigned int), 10u, false, pad, width);
+            break;
+        case 'x':
+            uart_fmt_putu(&n, buf, keep, va_arg(args, unsigned int), 16u, false, pad, width);
+            break;
+        case 'X':
+            uart_fmt_putu(&n, buf, keep, va_arg(args, unsigned int), 16u, true, pad, width);
+            break;
+        default:
+            uart_fmt_putc(&n, buf, keep, '%');
+            uart_fmt_putc(&n, buf, keep, fmt);
+            break;
+        }
+    }
+
+    buf[(n < keep) ? n : keep] = '\0';
+    return n;
+}
+
 int bsp_uart_printf(const char *format, ...)
 {
     va_list args;
@@ -120,7 +275,7 @@ int bsp_uart_printf(const char *format, ...)
     }
 
     va_start(args, format);
-    len = vsnprintf(g_uart_buf, (int)sizeof(g_uart_buf), format, args);
+    len = (int)uart_fmt(g_uart_buf, (uint32_t)sizeof(g_uart_buf), format, args);
     va_end(args);
 
     if (len <= 0) {

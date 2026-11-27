@@ -207,21 +207,59 @@ bool bsp_sdio_wait_transfer(uint32_t timeout_ms)
 
     while (!g_sdio_xfer_done) {
         if ((HAL_GetTick() - start) > timeout_ms) {
-            /* Транзакцию снимаем, иначе HAL_SD навсегда останется BUSY и
-               следующая запись вернёт HAL_BUSY (Docs/03 §2 — обработка сбоев) */
-            (void)HAL_SD_Abort(&g_hsd);
-            g_sdio_xfer_done = false;
-            g_sdio_xfer_error = false;
+            /* Транзакцию снимаем и восстанавливаем DMA-обвязку, иначе HAL_SD
+               навсегда останется BUSY и следующая запись вернёт HAL_BUSY
+               (Docs/03 §2 — обработка сбоев). abort_recover() сам гасит
+               g_sdio_xfer_done/g_sdio_xfer_error */
+            (void)bsp_sdio_abort_recover();
             return false;
         }
     }
 
     if (g_sdio_xfer_error) {
-        (void)HAL_SD_Abort(&g_hsd);
-        g_sdio_xfer_error = false;
-
+        (void)bsp_sdio_abort_recover();
         return false;
     }
 
     return true;
+}
+
+bool bsp_sdio_abort_recover(void)
+{
+    (void)HAL_SD_Abort(&g_hsd);
+
+    /* HAL_SD_Abort() гасит SDIO, но DMA-обвязку не восстанавливает:
+       HAL_DMA_Abort() внутри него не проверяет hdma/hdmarx на NULL и
+       возвращает HAL_ERROR, если поток был не в BUSY, оставляя состояние
+       не-READY. После этого HAL_DMA_Start_IT() вернёт HAL_ERROR на ЛЮБОЙ
+       следующей транзакции, и карта «умирает» до перезапуска питания.
+       Повторный HAL_SD_MspInit() делает HAL_DMA_Init() (принудительно
+       HAL_DMA_STATE_READY) и заново __HAL_LINKDMA() для hdmarx/hdmatx
+       (Docs/03 §2 — обработка сбоев). */
+    g_sdio_msp_error = false;
+    HAL_SD_MspInit(&g_hsd);
+
+    /* Флаги колбэков в чистую: старый done/не-снят-done не должен
+       «проскочить» в следующую транзакцию */
+    g_sdio_xfer_done = false;
+    g_sdio_xfer_error = false;
+
+    if (g_sdio_msp_error) {
+        /* Переинициализация DMA-потока не удалась: карта неработоспособна,
+           bsp_sdio_init() обязан пройти заново */
+        g_sdio_ready = false;
+        return false;
+    }
+
+    return true;
+}
+
+void bsp_sdio_reinit(void)
+{
+    /* L1 (Docs/03 §2): полный перезапуск инициализации карты. Обход
+       идемпотентного guard'а bsp_sdio_init() обязателен: иначе после 3
+       неудач записи «переинициализация» была бы пустым вызовом */
+    g_sdio_ready = false;
+
+    (void)bsp_sdio_init();
 }

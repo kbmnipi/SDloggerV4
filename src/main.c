@@ -355,11 +355,22 @@ int main(void)
        запуска. Этот цикл так же удерживает весь путь захвата от
        линкерского --gc-sections. --- */
     while (1) {
-        if (g_int1_triggered) {
+        bool fired;
+
+        /* Проверка и сброс флага — ОДНА атомарная операция (аудит M1, K3).
+           INT1 датчика — УРОВЕНЬ (Active HIGH), а EXTI настроен на нарастающий
+           фронт: если EXTI9_5_IRQHandler успеет взвести g_int1_triggered между
+           чтением и обнулением, флаг будет потерян, а новых фронтов не будет
+           никогда (линия уже HIGH) — захват вставал навечно при полном FIFO.
+           Критическая секция = 2 инструкции, захвату это не мешает. */
+        __disable_irq();
+        fired = g_int1_triggered;
+        g_int1_triggered = false;
+        __enable_irq();
+
+        if (fired) {
             uint16_t fifo_bytes;
             uint16_t read_len;
-
-            g_int1_triggered = false;
 
             /* Docs/02 §4 п.2: сначала динамика FIFO, потом вычитка */
             fifo_bytes = drv_bmi160_get_fifo_length();
@@ -378,13 +389,27 @@ int main(void)
             read_len = (fifo_bytes > (uint16_t)BSP_CAPTURE_MAX_LEN) ? (uint16_t)BSP_CAPTURE_MAX_LEN
                                                                     : fifo_bytes;
 
+            /* Округление ВНИЗ до кратного 7 (аудит M1, K4). Нечётный хвост
+               1..6 байт — часть фрейма: вычитав его из FIFO, следующая
+               DMA-вычитка начнётся с середины фрейма, парсер потеряет
+               синхронизацию и будет сыпать мусором до бесконечности. Хвост
+               остаётся в FIFO и дочитывается следующим заходом. */
+            read_len = (uint16_t)(read_len - (read_len % BSP_CAPTURE_FRAME_BYTES));
+            if (read_len == 0u) {
+                continue; /* меньше одного фрейма — вычитку не запускаем */
+            }
+
             /* g_dma_busy внутри bsp_capture_start_dma() глушит повторный
-               запуск, если предыдущая вычитка ещё в полёте */
-            bsp_capture_start_dma(spi_rx_buf, read_len);
+               запуск, если предыдущая вычитка ещё в полёте. Отказ — НЕ
+               потеря данных (FIFO датчика на месте), но и длину сохранять
+               нельзя: иначе разбор по capture_len пойдёт поверх буфера
+               ПРЕДЫДУЩЕЙ транзакции (аудит M1, V1). */
+            if (bsp_capture_start_dma(spi_rx_buf, read_len)) {
+                capture_len = read_len;
+            }
             if (bsp_capture_error_count() != 0u) {
                 fault_blink_code1();
             }
-            capture_len = read_len;
         }
 
         if (g_dma_done) {

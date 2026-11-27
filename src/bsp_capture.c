@@ -203,21 +203,22 @@ void bsp_capture_exti_init(void)
     HAL_NVIC_EnableIRQ(CAPTURE_EXTI_IRQn);
 }
 
-void bsp_capture_start_dma(uint8_t *dest_buf, uint16_t len)
+bool bsp_capture_start_dma(uint8_t *dest_buf, uint16_t len)
 {
     SPI_HandleTypeDef *hspi = drv_bmi160_spi_handle();
     uint8_t cmd = BMI160_CMD_READ_FIFO_DATA;
 
     /* Reentrancy gate: предыдущая вычитка ещё в полёте (FWM мог подняться
        раньше, чем главный цикл разобрал пакет). Перезапуск потоков на середине
-       транзакции изуродовал бы и буфер, и окно CS — отклоняем молча. */
+       транзакции изуродовал бы и буфер, и окно CS — отклоняем молча (false без
+       инкремента ошибок: вызывающий не должен был считать, что данные пришли). */
     if (g_dma_busy) {
-        return;
+        return false;
     }
 
     if (dest_buf == NULL || len == 0u || len > BSP_CAPTURE_MAX_LEN) {
         capture_fail();
-        return;
+        return false;
     }
 
     g_dma_busy = true;
@@ -229,7 +230,7 @@ void bsp_capture_start_dma(uint8_t *dest_buf, uint16_t len)
         !capture_quiesce_stream(&g_hdma_spi1_tx, CAPTURE_TX_DMA_FLAGS)) {
         g_dma_busy = false;
         capture_fail();
-        return;
+        return false;
     }
     capture_flush_spi_rx();
 
@@ -241,7 +242,7 @@ void bsp_capture_start_dma(uint8_t *dest_buf, uint16_t len)
         capture_flush_spi_rx();
         g_dma_busy = false;
         capture_fail();
-        return;
+        return false;
     }
 
     /* CRITICAL FIX (M0 hardening): незакрытый pending-бит NVIC или старый
@@ -260,7 +261,7 @@ void bsp_capture_start_dma(uint8_t *dest_buf, uint16_t len)
         drv_bmi160_cs_write(false);
         g_dma_busy = false;
         capture_fail();
-        return;
+        return false;
     }
 
     SPI1->CR2 |= SPI_CR2_TXDMAEN;
@@ -270,8 +271,10 @@ void bsp_capture_start_dma(uint8_t *dest_buf, uint16_t len)
         drv_bmi160_cs_write(false);
         g_dma_busy = false;
         capture_fail();
-        return;
+        return false;
     }
+
+    return true;
 }
 
 void bsp_capture_dma_complete(void)

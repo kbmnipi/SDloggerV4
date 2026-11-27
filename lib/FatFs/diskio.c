@@ -117,9 +117,16 @@ DRESULT disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
     bsp_sdio_transfer_begin();
 
     if (HAL_SD_ReadBlocks_DMA(hsd, buff, sector, count) != HAL_OK) {
+        /* Срыв транзакции обязателен (аудит M1, V4): иначе hsd остаётся BUSY и
+           каждая следующая операция чтения будет возвращать RES_ERROR до
+           перезапуска питания. abort_recover() = HAL_SD_Abort() + перепривязка
+           DMA-потока */
+        (void)bsp_sdio_abort_recover();
         return RES_ERROR;
     }
     if (!bsp_sdio_wait_transfer(DISK_XFER_TIMEOUT_MS)) {
+        /* При таймауте/ошибке bsp_sdio_wait_transfer() срывает транзакцию и
+           восстанавливает DMA-обвязку самостоятельно */
         return RES_ERROR;
     }
 
@@ -128,7 +135,8 @@ DRESULT disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
 
 /**
  * Одна попытка блочной записи: DMA -> ожидание конца -> CMD13 до TRANSFER.
- * Любой сбой — HAL_SD_Abort(): иначе hsd остаётся BUSY и следующая попытка
+ * Любой сбой — bsp_sdio_abort_recover() (= HAL_SD_Abort() + перепривязка
+ * DMA-потока): иначе hsd остаётся BUSY и следующая попытка
  * гарантированно вернёт HAL_BUSY вместо новой транзакции (Docs/03 §2).
  */
 static DRESULT sd_write_once(SD_HandleTypeDef *hsd, const BYTE *buff, DWORD sector, UINT count)
@@ -136,20 +144,20 @@ static DRESULT sd_write_once(SD_HandleTypeDef *hsd, const BYTE *buff, DWORD sect
     bsp_sdio_transfer_begin();
 
     if (HAL_SD_WriteBlocks_DMA(hsd, (uint8_t *)buff, sector, count) != HAL_OK) {
-        (void)HAL_SD_Abort(hsd);
+        (void)bsp_sdio_abort_recover();
         return RES_ERROR;
     }
     if (!bsp_sdio_wait_transfer(DISK_XFER_TIMEOUT_MS)) {
-        /* wait_transfer сам срывает транзакцию по таймауту/ошибке —
-           дублируем Abort для гарантии: перед ретраем HAL обязан быть READY */
-        (void)HAL_SD_Abort(hsd);
+        /* При таймауте/ошибке bsp_sdio_wait_transfer() сам срывает транзакцию
+           и перепривязывает DMA-поток — повторно срыв не нужен, повторный
+           HAL_SD_MspInit() по уже READY-потоку только съел бы время */
         return RES_ERROR;
     }
 
     /* Docs/03 §2: DMA закончен, когда данные ушли в буфер карты — сама карта
        ещё может программировать флеш (CMD13 до HAL_SD_CARD_TRANSFER) */
     if (!wait_card_transfer(hsd, (uint32_t)count)) {
-        (void)HAL_SD_Abort(hsd);
+        (void)bsp_sdio_abort_recover();
         return RES_ERROR;
     }
 
@@ -183,10 +191,12 @@ DRESULT disk_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
         }
     }
 
-    /* Все попытки исчерпаны: снимаем транзакцию с карты (иначе hsd навсегда
-       BUSY) и пробуем переинициализировать SDIO для следующих вызовов */
-    (void)HAL_SD_Abort(hsd);
-    (void)bsp_sdio_init();
+    /* Все попытки исчерпаны: срыв транзакции с перепривязкой DMA-потока и
+       L1 (Docs/03 §2) — полный перезапуск инициализации карты. Вызов
+       bsp_sdio_init() «напрямую» ничего не делал: идемпотентный guard
+       g_sdio_ready возвращал true сразу, и «переинициализация» была пустой */
+    (void)bsp_sdio_abort_recover();
+    bsp_sdio_reinit();
 
     return RES_ERROR;
 }

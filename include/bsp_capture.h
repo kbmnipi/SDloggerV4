@@ -63,14 +63,18 @@ void bsp_capture_exti_init(void);
  * Quiesce потоков -> CS = 0 -> командный байт 0xA4 опросом ->
  * RX DMA (SPI1->DR -> dest_buf) + TX DMA (dummy -> SPI1->DR).
  *
- * Если g_dma_busy (предыдущая вычитка ещё в полёте) — ранний возврат без
+ * Если g_dma_busy (предыдущая вычитка ещё в полёте) — возврат false БЕЗ
  * инкремента ошибок: транзакция не потеряна, просто ещё не завершилась.
  *
  * CS остаётся активным до прерывания завершения приёма
  * (bsp_capture_dma_complete()). Длина len: 1..BSP_CAPTURE_MAX_LEN,
  * dest_buf обязан лежать в D1 SRAM. Сбой увеличивает bsp_capture_error_count().
+ *
+ * Возврат ОБЯЗАТЕЛЕН к проверке (аудит M1, V1): true — транзакция реально
+ * стартовала, и только тогда len соответствует данным в dest_buf. false —
+ * буфер не заполнялся, разбирать по этому len нельзя.
  */
-void bsp_capture_start_dma(uint8_t *dest_buf, uint16_t len);
+bool bsp_capture_start_dma(uint8_t *dest_buf, uint16_t len);
 
 /**
  * Завершение приёма: вызывается из DMA2_Stream0_IRQHandler после снятия
