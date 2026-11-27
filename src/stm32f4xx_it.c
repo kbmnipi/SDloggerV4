@@ -9,9 +9,19 @@
 
 #include "stm32f4xx_hal.h"
 
-/* Линии EXTI, которые будут заняты: PB5 = BMI160 INT1 (Docs/01 §2).
-   Маска совпадает с номерами линий EXTI9..5 (GPIO_PIN_x == EXTI line x). */
-#define IT_EXTI9_5_LINES (GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_9)
+#include "bsp_capture.h"
+
+/* Фронт INT1 (PB5) и конец приёма FIFO по DMA — единственные данные, которые
+   прерывания передают главному циклу. Сбрасывает их main.c. */
+volatile bool g_int1_triggered;
+volatile bool g_dma_done;
+
+/* Линия BMI160 INT1: PB5 = линия EXTI5 (GPIO_PIN_x == номер линии EXTI, Docs/01 §2) */
+#define IT_EXTI_INT1_LINE GPIO_PIN_5
+#define IT_EXTI9_5_OTHER_LINES (GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_9)
+
+/* DMA2 Stream 0 = SPI1_RX (Docs/03 §1): флаги потока 0 сидят в DMA2_LIFCR */
+#define IT_DMA_S0_FLAGS (DMA_FLAG_FEIF0_4 | DMA_FLAG_DMEIF0_4 | DMA_FLAG_TEIF0_4 | DMA_FLAG_HTIF0_4 | DMA_FLAG_TCIF0_4)
 
 /* Флаги потока (RM0090): у DMA1 и DMA2 позиции битов одинаковые — флаги
    потоков 0..3 в LIFCR, потоков 4..7 в HIFCR. HAL покрывает обе половины
@@ -28,16 +38,43 @@ void SysTick_Handler(void)
     HAL_IncTick();
 }
 
-/* ---- безопасные заглушки на периферию будущих этапов (FIFO/DMA) ----
-   Пока NVIC этих периферий не включён, обработчики не вызываются. Если шум
-   на линии INT1 или случайный флаговый сброс поднимет прерывание, вектор не
-   должен уйти в .weak бесконечный цикл startup: флаги снимаются, выход.
-   На этапе FIFO/DMA сюда придёт настоящая логика (кольцевой буфер, DMA). */
-
+/**
+ * PB5 = BMI160 INT1 — порог заполнения FIFO (FWM), Active HIGH (Docs/01 §2,
+ * Docs/02 §3: INT_MAP_1 = 0x40, INT_OUT_CTRL = 0x0A).
+ * Обработчик только поднимает флаг: вычитку запускает главный цикл, чтобы
+ * прерывание датчика оставалось коротким и не мешало DMA SDIO.
+ */
 void EXTI9_5_IRQHandler(void)
 {
-    __HAL_GPIO_EXTI_CLEAR_IT(IT_EXTI9_5_LINES);
+    /* EXTI_PR: запись 1 в бит снимает флаг */
+    __HAL_GPIO_EXTI_CLEAR_IT(IT_EXTI_INT1_LINE);
+    g_int1_triggered = true;
+
+    /* Линии 6..9 на этом этапе не задействованы: снимаем и их флаги, иначе
+       чужой флаг группы будет поднимать прерывание повторно. */
+    __HAL_GPIO_EXTI_CLEAR_IT(IT_EXTI9_5_OTHER_LINES);
 }
+
+/**
+ * DMA2 Stream 0 = SPI1_RX: все байты FIFO_DATA приняты (Docs/03 §1).
+ * Флаги снимаем сами (HAL_DMA_IRQHandler здесь не вызывается), поэтому
+ * bsp_capture_start_dma() приводит состояние потоков в READY сам.
+ */
+void DMA2_Stream0_IRQHandler(void)
+{
+    /* DMA2_LIFCR: запись 1 в бит Cxxx снимает флаг потока */
+    DMA2->LIFCR = IT_DMA_S0_FLAGS;
+
+    /* Снимает DMA-запросы SPI1 и поднимает CS = 1 — конец транзакции BMI160 */
+    bsp_capture_dma_complete();
+
+    g_dma_done = true;
+}
+
+/* ---- безопасные заглушки на периферию будущих этапов (TIM2, SDIO) ----
+   Пока NVIC этих периферий не включён, обработчики не вызываются. Если шум
+   или случайный флаговый сброс поднимет прерывание, вектор не должен уйти в
+   .weak бесконечный цикл startup: флаги снимаются, выход. */
 
 void TIM2_IRQHandler(void)
 {

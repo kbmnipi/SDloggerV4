@@ -1,25 +1,31 @@
 /**
- * main.c — этап M0: тактирование 84 МГц + проверка присутствия BMI160.
+ * main.c — этап M0: тактирование 84 МГц + BMI160 + захват FIFO по SPI1 DMA.
  *
  * Порядок инициализации (порядок фиксирован аудитом M0):
- *   1) bsp_meminit()            — обнуление CCM (секция .ccmram — NOLOAD)
- *   2) HAL_Init()               — SysTick, приоритет grouped, NVIC
- *   3) led_init()               — PB2 ДО тактирования: при сбое HSE/PLL код 1
- *                                должен мигать уже настроенным выходом
- *   4) system_clock_84mhz_hse() — любой сбой -> fault_blink_code1()
- *   5) drv_bmi160_spi_init()    — false -> fault_blink_code1()
+ *   1) bsp_meminit()              — обнуление CCM (секция .ccmram — NOLOAD)
+ *   2) HAL_Init()                 — SysTick, приоритет grouped, NVIC
+ *   3) led_init()                 — PB2 ДО тактирования: при сбое HSE/PLL код 1
+ *                                  должен мигать уже настроенным выходом
+ *   4) system_clock_84mhz_hse()   — любой сбой -> fault_blink_code1()
+ *   5) drv_bmi160_spi_init()      — false -> fault_blink_code1()
+ *   6) drv_bmi160_init_sensor()   — CHIP_ID != 0xD1 -> fault_blink_code1()
+ *   7) drv_bmi160_configure_fifo()— FIFO watermark 56 Б, FWM -> INT1 (Docs/02 §3)
+ *   8) bsp_capture_dma_init()     — DMA2 Stream0/CH3 RX + Stream3/CH3 TX (Docs/03 §1)
+ *   9) bsp_capture_exti_init()    — PB5 EXTI, приоритет 6
+ *  10) bsp_capture_error_count()  — любой сбой DMA/EXTI -> fault_blink_code1()
  *
  * Индикация (Docs/06_error.md):
- *   CHIP_ID == 0xD1        -> мигаем PB2 с частотой 1 Гц (датчик на месте)
- *   CHIP_ID != 0xD1        -> код 1 (нет ответа от акселерометра): одна вспышка
- *                             PB2 каждые 3 с (200 мс горит / 2800 мс пауза)
+ *   CHIP_ID == 0xD1        -> PB2 дёргается на каждый фронт INT1 (~каждые 5 мс)
+ *   CHIP_ID != 0xD1 либо сбой SPI/DMA -> код 1: одна вспышка PB2 каждые 3 с
  *
- * SD-карта, FatFs и кольцевой буфер на этом шаге сознательно НЕ подключаются.
+ * Разбор фреймов FIFO и кольцевой буфер, SD-карта, FatFs и кнопка PC13 на этом
+ * этапе сознательно НЕ подключаются.
  */
 
 #include "stm32f4xx_hal.h"
 
 #include "drv_bmi160.h"
+#include "bsp_capture.h"
 #include "stm32f4xx_it.h"
 
 #define LED_PORT GPIOB
@@ -27,6 +33,10 @@
 
 #define ERROR_CODE1_BLINK_MS 200u  /* Docs/06_error.md §3: 200 мс горит  */
 #define ERROR_CODE1_PAUSE_MS 2800u /* ... и пауза до конца цикла в 3 с    */
+
+/* Приёмный буфер вычитки FIFO_DATA (0x24). DMA2 видит только D1 SRAM,
+   поэтому буфер обязан лежать в .d1ram (Docs/01 §5, Docs/03 §1). */
+static uint8_t spi_rx_buf[BSP_CAPTURE_BUF_SIZE] __attribute__((section(".d1ram"), aligned(4)));
 
 /* Границы секции .ccmram из scripts/STM32F405RGT6_CCM.ld. Секция NOLOAD:
    startup_stm32f405xx.S обнуляет только _sbss.._ebss в D1 SRAM и до CCM
@@ -137,8 +147,37 @@ int main(void)
         fault_blink_code1();
     }
 
+    /* FIFO: watermark 56 байт, acc+header, FWM -> INT1 (PB5), Flush FIFO */
+    if (!drv_bmi160_configure_fifo()) {
+        fault_blink_code1();
+    }
+
+    bsp_capture_dma_init();  /* DMA2 Stream0/CH3 = SPI1_RX, Stream3/CH3 = SPI1_TX */
+    bsp_capture_exti_init(); /* PB5 = EXTI5, нарастающий фронт, NVIC приоритет 6  */
+
+    if (bsp_capture_error_count() != 0u) {
+        fault_blink_code1();
+    }
+
     while (1) {
-        HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
-        HAL_Delay(500);
+        if (g_int1_triggered) {
+            g_int1_triggered = false;
+
+            /* PB2 дёргается на каждый фронт INT1 — визуальная проверка того,
+               что датчик поднимает FWM и линия PB5 жива */
+            HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
+
+            /* Сырые 56 байт FIFO (8 фреймов по 7 байт) в spi_rx_buf по DMA */
+            bsp_capture_start_dma(spi_rx_buf, BMI160_FIFO_WATERMARK_BYTES);
+            if (bsp_capture_error_count() != 0u) {
+                fault_blink_code1();
+            }
+        }
+
+        if (g_dma_done) {
+            /* Разбор заголовков 0x84/0x80/0x40 и запись в кольцевой буфер —
+               следующий этап (Docs/02 §4, Docs/05 §2). Здесь только сброс. */
+            g_dma_done = false;
+        }
     }
 }

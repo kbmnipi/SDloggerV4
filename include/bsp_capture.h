@@ -1,0 +1,70 @@
+/**
+ * bsp_capture.h — hardware-захват сырых байтов FIFO датчика BMI160 по SPI1 DMA.
+ *
+ * Назначение этапа (Docs/05 §3 M0): проверить прерывание INT1 (PB5) и пакетную
+ * вычитку FIFO_DATA (0x24) потоками DMA2. Разбор фреймов (0x84 / 0x80 / 0x40)
+ * и кольцевой буфер на этом этапе СОЗНАТЕЛЬНО не реализуются.
+ *
+ * Назначение потоков (Docs/03_sdio_and_dma.md §1, матрица RM0090):
+ *   DMA2 Stream 0 / Channel 3 -> SPI1_RX (периферия -> память)
+ *   DMA2 Stream 3 / Channel 3 -> SPI1_TX (память -> периферия, dummy-байты)
+ *   PB5 -> EXTI9_5 (нарастающий фронт, INT1 датчика Active HIGH)
+ *
+ * Все буферы, участвующие в DMA, лежат в D1 SRAM (Docs/01 §5).
+ */
+
+#ifndef BSP_CAPTURE_H
+#define BSP_CAPTURE_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/** Размер приёмного буфера spi_rx_buf вызывающего (Docs/01 §5). */
+#define BSP_CAPTURE_BUF_SIZE 256u
+
+/** Потолок одной DMA-вычитки: 252 = 36 * 7 байт (Docs/02 §4 п.4). */
+#define BSP_CAPTURE_MAX_LEN 252u
+
+/**
+ * Инициализация DMA2 Stream 0 (SPI1_RX) и Stream 3 (SPI1_TX) + NVIC для
+ * Stream 0 (прерывание Transfer Complete). Сбой HAL_DMA_Init() увеличивает
+ * bsp_capture_error_count().
+ */
+void bsp_capture_dma_init(void);
+
+/**
+ * Инициализация PB5 как EXTI (нарастающий фронт, INT1 датчика Active HIGH)
+ * и включение EXTI9_5_IRQn с приоритетом 6.
+ */
+void bsp_capture_exti_init(void);
+
+/**
+ * Запуск пакетного чтения FIFO_DATA (0x24) в dest_buf (Docs/02 §4):
+ * Quiesce потоков -> CS = 0 -> командный байт 0xA4 опросом ->
+ * RX DMA (SPI1->DR -> dest_buf) + TX DMA (dummy -> SPI1->DR).
+ *
+ * CS остаётся активным до прерывания завершения приёма
+ * (bsp_capture_dma_complete()). Длина len: 1..BSP_CAPTURE_MAX_LEN,
+ * dest_buf обязан лежать в D1 SRAM. Сбой увеличивает bsp_capture_error_count().
+ */
+void bsp_capture_start_dma(uint8_t *dest_buf, uint16_t len);
+
+/**
+ * Завершение приёма: вызывается из DMA2_Stream0_IRQHandler после снятия
+ * флагов потока. Гасит DMA-запросы SPI1 и поднимает CS (конец транзакции
+ * BMI160 определяется по фронту CS = 1).
+ */
+void bsp_capture_dma_complete(void);
+
+/** Число сбоев инициализации/запуска вычитки (запрет тихих отказов). */
+uint32_t bsp_capture_error_count(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* BSP_CAPTURE_H */

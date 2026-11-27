@@ -17,7 +17,25 @@
 #define BMI160_REG_SPI_WAKEUP 0x7Fu
 
 #define BMI160_CMD_SOFT_RESET 0xB6u
+#define BMI160_CMD_FIFO_FLUSH 0xB0u /* Docs/02 §2: очистить FIFO */
 #define BMI160_ADDR_READ 0x80u
+
+/* Регистры FIFO/прерываний (Docs/02_bmi160_ref.md раздел 2) */
+#define BMI160_REG_FIFO_CONFIG_0 0x46u
+#define BMI160_REG_FIFO_CONFIG_1 0x47u
+#define BMI160_REG_INT_EN_1 0x51u
+#define BMI160_REG_INT_OUT_CTRL 0x53u
+#define BMI160_REG_INT_MAP_1 0x56u
+
+/* Значения профиля 1600 Гц / +/-16 g (Docs/02_bmi160_ref.md раздел 3) */
+#define BMI160_FIFO_CONFIG_0_VALUE 0x0Eu /* fifo_water_mark = 14 * 4 = 56 байт  */
+#define BMI160_FIFO_CONFIG_1_VALUE 0x50u /* fifo_acc_en | fifo_header_en        */
+#define BMI160_INT_EN_1_VALUE 0x40u      /* int_fwm_en                          */
+#define BMI160_INT_MAP_1_VALUE 0x40u     /* int1_fwm -> INT1                    */
+#define BMI160_INT_OUT_CTRL_VALUE 0x0Au  /* int1_output_en | int1_lvl (HIGH)    */
+
+/* Прогрев FIFO после Flush перед началом записи (Docs/02 §4 п.7) */
+#define BMI160_FIFO_FLUSH_SETTLE_MS 50u
 
 /* PA4 — CS, активный LOW; PA5 — SCK, PA6 — MISO, PA7 — MOSI (AF5) */
 #define BMI160_CS_PORT GPIOA
@@ -38,34 +56,48 @@ static void bmi160_cs_high(void)
     HAL_GPIO_WritePin(BMI160_CS_PORT, BMI160_CS_PIN, GPIO_PIN_SET);
 }
 
-static uint8_t bmi160_xfer(uint8_t out)
+static bool bmi160_xfer(uint8_t out, uint8_t *in)
 {
-    uint8_t in = 0x00u;
+    uint8_t rx = 0x00u;
 
-    if (HAL_SPI_TransmitReceive(&g_hspi1, &out, &in, 1u, BMI160_SPI_TIMEOUT_MS) != HAL_OK) {
-        return 0x00u;
+    if (HAL_SPI_TransmitReceive(&g_hspi1, &out, &rx, 1u, BMI160_SPI_TIMEOUT_MS) != HAL_OK) {
+        return false;
     }
-    return in;
+    if (in != NULL) {
+        *in = rx;
+    }
+    return true;
 }
 
 static uint8_t bmi160_read_reg(uint8_t addr)
 {
-    uint8_t value;
+    uint8_t value = 0x00u;
 
     bmi160_cs_low();
-    (void)bmi160_xfer(BMI160_ADDR_READ | (addr & 0x7Fu));
-    value = bmi160_xfer(0xFFu);
+    if (!bmi160_xfer(BMI160_ADDR_READ | (addr & 0x7Fu), NULL)) {
+        bmi160_cs_high();
+        return 0x00u;
+    }
+    if (!bmi160_xfer(0xFFu, &value)) {
+        bmi160_cs_high();
+        return 0x00u;
+    }
     bmi160_cs_high();
 
     return value;
 }
 
-static void bmi160_write_reg(uint8_t addr, uint8_t value)
+static bool bmi160_write_reg(uint8_t addr, uint8_t value)
 {
+    bool ok_addr;
+    bool ok_value;
+
     bmi160_cs_low();
-    (void)bmi160_xfer(addr & 0x7Fu);
-    (void)bmi160_xfer(value);
+    ok_addr = bmi160_xfer(addr & 0x7Fu, NULL);
+    ok_value = bmi160_xfer(value, NULL);
     bmi160_cs_high();
+
+    return ok_addr && ok_value;
 }
 
 bool drv_bmi160_spi_init(void)
@@ -123,8 +155,9 @@ uint8_t drv_bmi160_init_sensor(void)
     (void)bmi160_read_reg(BMI160_REG_SPI_WAKEUP);
     HAL_Delay(5);
 
-    /* 2. Soft Reset (после него интерфейс снова I2C) */
-    bmi160_write_reg(BMI160_REG_CMD, BMI160_CMD_SOFT_RESET);
+    /* 2. Soft Reset (после него интерфейс снова I2C). Сбой здесь проявится
+       на шаге 4: CHIP_ID не будет 0xD1 -> вызывающий уходит в код ошибки 1. */
+    (void)bmi160_write_reg(BMI160_REG_CMD, BMI160_CMD_SOFT_RESET);
     HAL_Delay(10);
 
     /* 3. Повторно переключаем в SPI */
@@ -133,4 +166,43 @@ uint8_t drv_bmi160_init_sensor(void)
 
     /* 4. ID датчика: 0xD1, если BMI160 на месте и линия SPI жива */
     return bmi160_read_reg(BMI160_REG_CHIP_ID);
+}
+
+bool drv_bmi160_configure_fifo(void)
+{
+    /* Порядок по Docs/02 §4 п.6..7: сначала конфигурация, затем Flush FIFO.
+       Каждая запись проверяется: сбой SPI1 -> false без исключений. */
+    if (!bmi160_write_reg(BMI160_REG_FIFO_CONFIG_0, BMI160_FIFO_CONFIG_0_VALUE)) {
+        return false;
+    }
+    if (!bmi160_write_reg(BMI160_REG_FIFO_CONFIG_1, BMI160_FIFO_CONFIG_1_VALUE)) {
+        return false;
+    }
+    if (!bmi160_write_reg(BMI160_REG_INT_EN_1, BMI160_INT_EN_1_VALUE)) {
+        return false;
+    }
+    if (!bmi160_write_reg(BMI160_REG_INT_MAP_1, BMI160_INT_MAP_1_VALUE)) {
+        return false;
+    }
+    if (!bmi160_write_reg(BMI160_REG_INT_OUT_CTRL, BMI160_INT_OUT_CTRL_VALUE)) {
+        return false;
+    }
+    if (!bmi160_write_reg(BMI160_REG_CMD, BMI160_CMD_FIFO_FLUSH)) {
+        return false;
+    }
+
+    /* Docs/02 §4 п.7: после Flush датчику нужно 50 мс до начала записи FIFO */
+    HAL_Delay(BMI160_FIFO_FLUSH_SETTLE_MS);
+
+    return true;
+}
+
+SPI_HandleTypeDef *drv_bmi160_spi_handle(void)
+{
+    return &g_hspi1;
+}
+
+void drv_bmi160_cs_write(bool asserted)
+{
+    HAL_GPIO_WritePin(BMI160_CS_PORT, BMI160_CS_PIN, asserted ? GPIO_PIN_RESET : GPIO_PIN_SET);
 }
