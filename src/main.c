@@ -25,8 +25,9 @@
  * Настольный тест (контейнер VLOG пока НЕ делается): TEST.BIN открывается на
  * FA_CREATE_ALWAYS|FA_WRITE, в него пишется ОДИН блок 4096 байт из D1 SRAM
  * (16 байт заголовка заполнены 0xAA, далее сквозной счётчик), далее f_sync +
- * f_close, 4 быстрые вспышки PB2 и остановка в while(1). Цикл захвата
- * датчика на этом этапе сознательно НЕ запускается.
+ * f_close, 4 быстрые вспышки PB2. После теста запускается цикл захвата
+ * датчика (INT1 -> FIFO_LENGTH -> DMA-вычитка -> разбор -> кольцо,
+ * Docs/05 §2): он же не даёт линкеру --gc-sections выбросить код захвата.
  *
  * Индикация (Docs/06_error.md):
  *   карта смонтирована  -> 3 быстрые вспышки PB2
@@ -75,9 +76,6 @@
 #define TEST_HEADER_BYTES 16u
 #define TEST_HEADER_FILL 0xAAu
 
-/* Пауза цикла остановки после успешного теста */
-#define HALT_LOOP_MS 1000u
-
 /* Тестовый блок 4096 байт. f_write -> disk_write -> HAL_SD_WriteBlocks_DMA,
    поэтому буфер обязан лежать в D1 SRAM и быть выровнен по 4 (Docs/01 §5,
    Docs/03 §1); проверка буфера в lib/FatFs/diskio.c иначе вернёт RES_PARERR */
@@ -88,6 +86,14 @@ static uint8_t test_block[TEST_WRITE_BYTES] __attribute__((section(".d1ram"), al
    (Docs/01 §5) */
 static FATFS fs;
 static FIL test_file;
+
+/* Приёмный буфер DMA-вычитки FIFO_DATA. Участвует в DMA2 Stream0 -> только
+   D1 SRAM, выравнивание 4 (Docs/01 §5) */
+static uint8_t spi_rx_buf[BSP_CAPTURE_BUF_SIZE] __attribute__((section(".d1ram"), aligned(4)));
+
+/* Счётчик SENSOR_OVR (FIFO >= 1015 байт) — войдёт в заголовок блока VLOG
+   (Docs/04 §3) на этапе контейнера; здесь только накопление */
+static volatile uint32_t g_sensor_ovr_count;
 
 
 /* Границы секции .ccmram из scripts/STM32F405RGT6_CCM.ld. Секция NOLOAD:
@@ -207,6 +213,7 @@ static void fill_test_block(void)
 int main(void)
 {
     uint8_t chip_id;
+    uint16_t capture_len = 0u;
     FRESULT fr;
     UINT bw;
 
@@ -342,8 +349,57 @@ int main(void)
         HAL_Delay(OK_FLASH_MS);
     }
 
-    /* Захват датчика на этом этапе сознательно не запускается: остановка */
+    /* --- цикл захвата датчика (Docs/05 §2 п.1, Docs/02 §4 п.2..4):
+       INT1 -> FIFO_LENGTH -> DMA-вычитка -> разбор -> кольцо. Динамика
+       FIFO читается каждый раз заново, размер вычитки — срез на момент
+       запуска. Этот цикл так же удерживает весь путь захвата от
+       линкерского --gc-sections. --- */
     while (1) {
-        HAL_Delay(HALT_LOOP_MS);
+        if (g_int1_triggered) {
+            uint16_t fifo_bytes;
+            uint16_t read_len;
+
+            g_int1_triggered = false;
+
+            /* Docs/02 §4 п.2: сначала динамика FIFO, потом вычитка */
+            fifo_bytes = drv_bmi160_get_fifo_length();
+            if (fifo_bytes > BMI160_FIFO_LENGTH_MAX) {
+                /* 0xFFFF: линия SPI1 сдохла — вычитку не запускаем, датчик не трогаем */
+                continue;
+            }
+            if (fifo_bytes == 0u) {
+                continue; /* Docs/02 §4 п.3: прерывание снято, читать нечего */
+            }
+            if (fifo_bytes >= BSP_CAPTURE_FIFO_OVR_BYTES) {
+                g_sensor_ovr_count++; /* SENSOR_OVR в заголовок блока, Docs/04 §3 */
+            }
+
+            /* Docs/02 §4 п.4: N = min(fifo_bytes, 252) */
+            read_len = (fifo_bytes > (uint16_t)BSP_CAPTURE_MAX_LEN) ? (uint16_t)BSP_CAPTURE_MAX_LEN
+                                                                    : fifo_bytes;
+
+            /* g_dma_busy внутри bsp_capture_start_dma() глушит повторный
+               запуск, если предыдущая вычитка ещё в полёте */
+            bsp_capture_start_dma(spi_rx_buf, read_len);
+            if (bsp_capture_error_count() != 0u) {
+                fault_blink_code1();
+            }
+            capture_len = read_len;
+        }
+
+        if (g_dma_done) {
+            g_dma_done = false;
+
+            /* Разбор принятого пакета и складывание {x, y, z} в текущий слот
+               кольца (Docs/02 §4, Docs/05 §2 п.1) */
+            bsp_capture_parse_fifo(spi_rx_buf, capture_len);
+            if (bsp_capture_error_count() != 0u) {
+                fault_blink_code1();
+            }
+
+            /* PB2 дёргается на каждый разобранный пакет — визуальная
+               проверка всего цикла: INT1 -> DMA -> разбор -> кольцо */
+            HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
+        }
     }
 }

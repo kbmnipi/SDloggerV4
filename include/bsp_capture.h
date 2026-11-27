@@ -19,9 +19,19 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "stm32f4xx_hal.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/**
+ * Вычитка FIFO по DMA в полёте: true с момента bsp_capture_start_dma()
+ * до входа в DMA2_Stream0_IRQHandler (TC или ошибка). Повторный вызов
+ * bsp_capture_start_dma() при true молча отклоняется — защита от гонки,
+ * когда EXTI успевает поднять следующий FWM раньше разбора пакета.
+ */
+extern volatile bool g_dma_busy;
 
 /** Размер приёмного буфера spi_rx_buf вызывающего (Docs/01 §5). */
 #define BSP_CAPTURE_BUF_SIZE 256u
@@ -53,6 +63,9 @@ void bsp_capture_exti_init(void);
  * Quiesce потоков -> CS = 0 -> командный байт 0xA4 опросом ->
  * RX DMA (SPI1->DR -> dest_buf) + TX DMA (dummy -> SPI1->DR).
  *
+ * Если g_dma_busy (предыдущая вычитка ещё в полёте) — ранний возврат без
+ * инкремента ошибок: транзакция не потеряна, просто ещё не завершилась.
+ *
  * CS остаётся активным до прерывания завершения приёма
  * (bsp_capture_dma_complete()). Длина len: 1..BSP_CAPTURE_MAX_LEN,
  * dest_buf обязан лежать в D1 SRAM. Сбой увеличивает bsp_capture_error_count().
@@ -77,6 +90,21 @@ void bsp_capture_dma_complete(void);
  * За предел len чтение не выходит: неполный фрейм в конце пакета отбрасывается.
  */
 void bsp_capture_parse_fifo(uint8_t *buf, uint16_t len);
+
+/**
+ * Инкремент счётчика ошибок из DMA2_Stream0_IRQHandler (TEIF0/FEIF0/DMEIF0):
+ * счётчик g_capture_errors статический в bsp_capture.c, наружу — только счётчик
+ * и этот raising-хелпер.
+ */
+void bsp_capture_error_raise(void);
+
+/**
+ * Ручки потоков SPI1-вычитки наружу: DMA2_Stream0_IRQHandler обязан привести
+ * State обоих потоков в HAL_DMA_STATE_READY (свой и TX), иначе следующий
+ * HAL_DMA_Start_IT() вернёт HAL_ERROR.
+ */
+DMA_HandleTypeDef *bsp_capture_rx_dma_handle(void);
+DMA_HandleTypeDef *bsp_capture_tx_dma_handle(void);
 
 /** Число Skip-фреймов (SENSOR_OVR для заголовка блока, Docs/04 §3). */
 uint32_t bsp_capture_skip_frame_count(void);

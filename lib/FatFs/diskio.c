@@ -29,6 +29,8 @@
 #define DISK_XFER_TIMEOUT_MS 1000u
 /* Docs/03 §2: до 450 мс на блок — карта программирует флеш после DMA */
 #define DISK_CARD_STATE_MS_PER_BLOCK 450u
+/* L0: число попыток одной блочной записи до Abort + re-init (Docs/03 §2) */
+#define DISK_WRITE_RETRY_COUNT 3u
 
 static bool buf_is_dmable(const void *buf, uint32_t bytes)
 {
@@ -42,6 +44,13 @@ static bool buf_is_dmable(const void *buf, uint32_t bytes)
         return false; /* SDIO-DMA ходит словами (bsp_sdio.c: MDATAALIGN_WORD) */
     }
     if (addr < D1_SRAM_START || addr >= D1_SRAM_END) {
+        return false;
+    }
+
+    /* Защита от переноса: bytes > размера D1 (0x20020000) обязан быть
+       отвергнут ДО сложения — иначе addr + bytes заворачивается по uint32_t
+       и «влезшая» в конец SRAM хвостом проверка врёт о чужом буфере */
+    if (bytes > D1_SRAM_END) {
         return false;
     }
 
@@ -117,6 +126,36 @@ DRESULT disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
     return RES_OK;
 }
 
+/**
+ * Одна попытка блочной записи: DMA -> ожидание конца -> CMD13 до TRANSFER.
+ * Любой сбой — HAL_SD_Abort(): иначе hsd остаётся BUSY и следующая попытка
+ * гарантированно вернёт HAL_BUSY вместо новой транзакции (Docs/03 §2).
+ */
+static DRESULT sd_write_once(SD_HandleTypeDef *hsd, const BYTE *buff, DWORD sector, UINT count)
+{
+    bsp_sdio_transfer_begin();
+
+    if (HAL_SD_WriteBlocks_DMA(hsd, (uint8_t *)buff, sector, count) != HAL_OK) {
+        (void)HAL_SD_Abort(hsd);
+        return RES_ERROR;
+    }
+    if (!bsp_sdio_wait_transfer(DISK_XFER_TIMEOUT_MS)) {
+        /* wait_transfer сам срывает транзакцию по таймауту/ошибке —
+           дублируем Abort для гарантии: перед ретраем HAL обязан быть READY */
+        (void)HAL_SD_Abort(hsd);
+        return RES_ERROR;
+    }
+
+    /* Docs/03 §2: DMA закончен, когда данные ушли в буфер карты — сама карта
+       ещё может программировать флеш (CMD13 до HAL_SD_CARD_TRANSFER) */
+    if (!wait_card_transfer(hsd, (uint32_t)count)) {
+        (void)HAL_SD_Abort(hsd);
+        return RES_ERROR;
+    }
+
+    return RES_OK;
+}
+
 DRESULT disk_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
 {
     SD_HandleTypeDef *hsd;
@@ -136,22 +175,20 @@ DRESULT disk_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
     }
 
     hsd = bsp_sdio_handle();
-    bsp_sdio_transfer_begin();
 
-    if (HAL_SD_WriteBlocks_DMA(hsd, (uint8_t *)buff, sector, count) != HAL_OK) {
-        return RES_ERROR;
-    }
-    if (!bsp_sdio_wait_transfer(DISK_XFER_TIMEOUT_MS)) {
-        return RES_ERROR;
-    }
-
-    /* Docs/03 §2: DMA закончен, когда данные ушли в буфер карты — сама карта
-       ещё может программировать флеш (CMD13 до HAL_SD_CARD_TRANSFER) */
-    if (!wait_card_transfer(hsd, (uint32_t)count)) {
-        return RES_ERROR;
+    /* L0 (Docs/03 §2): три попытки DMA-записи с ожиданием CMD13 */
+    for (uint32_t attempt = 0u; attempt < DISK_WRITE_RETRY_COUNT; attempt++) {
+        if (sd_write_once(hsd, buff, sector, count) == RES_OK) {
+            return RES_OK;
+        }
     }
 
-    return RES_OK;
+    /* Все попытки исчерпаны: снимаем транзакцию с карты (иначе hsd навсегда
+       BUSY) и пробуем переинициализировать SDIO для следующих вызовов */
+    (void)HAL_SD_Abort(hsd);
+    (void)bsp_sdio_init();
+
+    return RES_ERROR;
 }
 
 DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff)

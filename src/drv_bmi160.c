@@ -41,14 +41,27 @@
 /* FIFO_LENGTH_1 (0x23): fifo_byte_counter[10:8], маска 0x07 (Docs/02 §2) */
 #define BMI160_FIFO_LENGTH_HI_MASK 0x07u
 
-/* Значения профиля 1600 Гц / +/-16 g (Docs/02_bmi160_ref.md раздел 3) */
+/* Значения профиля 1600 Гц / +/-16 g (Docs/02_bmi160_ref.md раздел 3).
+   Разбор побитово сверен с официальным Bosch BMI160 API (_Inbox/bmi160_defs.h,
+   маски записаны скобками в комментариях) — значения совпадают:
+     ACC_CONF       = BMI160_ACCEL_BW_OSR2_AVG2 (0x01<<4) | BMI160_ACCEL_ODR_1600HZ (0x0C)
+     ACC_RANGE      = BMI160_ACCEL_RANGE_16G (0x0C)
+     FIFO_CONFIG_1  = BMI160_FIFO_ACCEL (0x40) | BMI160_FIFO_HEADER (0x10)
+     INT_OUT_CTRL   = BMI160_INT1_OUTPUT_EN (0x08) | int1_lvl HIGH (0x02);
+                      BMI160_INT1_OUTPUT_MODE (0x04) = 0 -> Push-Pull, как требует
+                      Docs/01 §2 (push-pull подтверждён bmi160.c:5084-5085:
+                      output_mode ставится именно в бит 0x04) */
 #define BMI160_ACC_CONF_VALUE 0x1Cu    /* acc_bwp = OSR2 (-3 дБ на 324 Гц), acc_odr = 1600 Гц */
 #define BMI160_ACC_RANGE_VALUE 0x0Cu   /* +/-16 g, 2048 LSB/g (488 мкг/LSB)                 */
-#define BMI160_FIFO_CONFIG_0_VALUE 0x0Eu /* fifo_water_mark = 14 * 4 = 56 байт  */
-#define BMI160_FIFO_CONFIG_1_VALUE 0x50u /* fifo_acc_en | fifo_header_en        */
-#define BMI160_INT_EN_1_VALUE 0x40u      /* int_fwm_en                          */
-#define BMI160_INT_MAP_1_VALUE 0x40u     /* int1_fwm -> INT1                    */
-#define BMI160_INT_OUT_CTRL_VALUE 0x0Au  /* int1_output_en | int1_lvl (HIGH)    */
+#define BMI160_FIFO_CONFIG_0_VALUE 0x0Eu /* fifo_water_mark = 14 * 4 = 56 байт              */
+#define BMI160_FIFO_CONFIG_1_VALUE 0x50u /* BMI160_FIFO_ACCEL | BMI160_FIFO_HEADER            */
+#define BMI160_INT_EN_1_VALUE 0x40u      /* int_fwm_en (бит 6)                                */
+#define BMI160_INT_MAP_1_VALUE 0x40u     /* int1_fwm (бит 6) -> INT1                            */
+#define BMI160_INT1_OUTPUT_EN_MASK 0x08u /* Bosch BMI160_INT1_OUTPUT_EN_MASK   — выход INT1 включён */
+#define BMI160_INT1_LVL_HIGH_MASK 0x02u  /* Bosch bit1 (output_type) = 1       — Active HIGH        */
+#define BMI160_INT1_OUTPUT_MODE_MASK 0x04u /* Bosch BMI160_INT1_OUTPUT_MODE_MASK — 0 = Push-Pull    */
+#define BMI160_INT_OUT_CTRL_VALUE (BMI160_INT1_OUTPUT_EN_MASK | BMI160_INT1_LVL_HIGH_MASK)
+/* INT1: output_en | lvl HIGH, OUTPUT_MODE (0x04) = 0 -> Push-Pull */
 
 /* Пауза после CMD = 0x11 до проверки PMU_STATUS (Docs/02 §4 п.5) */
 #define BMI160_ACC_NORMAL_SETTLE_MS 5u
@@ -184,7 +197,15 @@ uint8_t drv_bmi160_init_sensor(void)
     HAL_Delay(5);
 
     /* 4. ID датчика: 0xD1, если BMI160 на месте и линия SPI жива */
-    return bmi160_read_reg(BMI160_REG_CHIP_ID);
+    uint8_t chip_id = bmi160_read_reg(BMI160_REG_CHIP_ID);
+
+    /* t_IDLE >= 450 мкс (Docs/02 §2): CS обязан отдыхать между транзакциями.
+       Строго здесь, а не «на глаз» по таймингам UART-печати вызывающего:
+       1 мс гарантированно перекрывает 450 мкс перед следующей командой
+       (CMD = 0x11 в drv_bmi160_start_accel()) */
+    HAL_Delay(1);
+
+    return chip_id;
 }
 
 bool drv_bmi160_start_accel(void)

@@ -17,9 +17,8 @@
 volatile bool g_int1_triggered;
 volatile bool g_dma_done;
 
-/* Линия BMI160 INT1: PB5 = линия EXTI5 (GPIO_PIN_x == номер линии EXTI, Docs/01 §2) */
-#define IT_EXTI_INT1_LINE GPIO_PIN_5
-#define IT_EXTI9_5_OTHER_LINES (GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_9)
+/* Линия BMI160 INT1: PB5 = линия EXTI5 (EXTI_PR_PR5, Docs/01 §2) */
+#define IT_EXTI_INT1_LINE EXTI_PR_PR5
 
 /* DMA2 Stream 0 = SPI1_RX (Docs/03 §1): флаги потока 0 сидят в DMA2_LIFCR */
 #define IT_DMA_S0_FLAGS (DMA_FLAG_FEIF0_4 | DMA_FLAG_DMEIF0_4 | DMA_FLAG_TEIF0_4 | DMA_FLAG_HTIF0_4 | DMA_FLAG_TCIF0_4)
@@ -44,32 +43,55 @@ void SysTick_Handler(void)
  * Docs/02 §3: INT_MAP_1 = 0x40, INT_OUT_CTRL = 0x0A).
  * Обработчик только поднимает флаг: вычитку запускает главный цикл, чтобы
  * прерывание датчика оставалось коротким и не мешало DMA SDIO.
+ *
+ * Обрабатываем СТРОГО линию 5: линии 6..9 принадлежат будущим узлам, их
+ * флаги снимает только их собственный обработчик — иначе мы тихо украдем
+ * чужое событие.
  */
 void EXTI9_5_IRQHandler(void)
 {
     /* EXTI_PR: запись 1 в бит снимает флаг */
-    __HAL_GPIO_EXTI_CLEAR_IT(IT_EXTI_INT1_LINE);
-    g_int1_triggered = true;
-
-    /* Линии 6..9 на этом этапе не задействованы: снимаем и их флаги, иначе
-       чужой флаг группы будет поднимать прерывание повторно. */
-    __HAL_GPIO_EXTI_CLEAR_IT(IT_EXTI9_5_OTHER_LINES);
+    if ((EXTI->PR & IT_EXTI_INT1_LINE) != 0u) {
+        g_int1_triggered = true;
+        EXTI->PR = IT_EXTI_INT1_LINE;
+    }
 }
 
 /**
  * DMA2 Stream 0 = SPI1_RX: все байты FIFO_DATA приняты (Docs/03 §1).
- * Флаги снимаем сами (HAL_DMA_IRQHandler здесь не вызывается), поэтому
- * bsp_capture_start_dma() приводит состояние потоков в READY сам.
+ * Флаги снимаем сами (HAL_DMA_IRQHandler здесь не вызывается), State обоих
+ * потоков приводим в READY — иначе следующий HAL_DMA_Start_IT() вернёт
+ * HAL_ERROR.
  */
 void DMA2_Stream0_IRQHandler(void)
 {
-    /* DMA2_LIFCR: запись 1 в бит Cxxx снимает флаг потока */
-    DMA2->LIFCR = IT_DMA_S0_FLAGS;
+    /* С этого момента новая вычитка разрешена: gate открываем первым, чтобы
+       не потерять FWM, пришедший в гоночке с окончанием обработки */
+    g_dma_busy = false;
 
-    /* Снимает DMA-запросы SPI1 и поднимает CS = 1 — конец транзакции BMI160 */
-    bsp_capture_dma_complete();
+    /* Ошибки — до TC: transfer/direct-mode/FIFO error. Пакет потерян, но
+       главный цикл не должен остаться ждать g_dma_done, а SPI1 — вечно
+       держать запрос DMA и опущенный CS посреди окна FIFO_DATA. */
+    if ((DMA2->LISR & (DMA_LISR_TEIF0 | DMA_LISR_FEIF0 | DMA_LISR_DMEIF0)) != 0u) {
+        bsp_capture_error_raise();
+        /* DMA2_LIFCR: запись 1 в бит Cxxx снимает флаг потока */
+        DMA2->LIFCR = IT_DMA_S0_FLAGS;
+        bsp_capture_dma_complete();
+        bsp_capture_rx_dma_handle()->State = HAL_DMA_STATE_READY;
+        bsp_capture_tx_dma_handle()->State = HAL_DMA_STATE_READY;
+        return;
+    }
 
-    g_dma_done = true;
+    if ((DMA2->LISR & DMA_LISR_TCIF0) != 0u) {
+        DMA2->LIFCR = IT_DMA_S0_FLAGS;
+        g_dma_done = true;
+
+        /* Снимает DMA-запросы SPI1 и поднимает CS = 1 — конец транзакции BMI160 */
+        bsp_capture_dma_complete();
+
+        bsp_capture_rx_dma_handle()->State = HAL_DMA_STATE_READY;
+        bsp_capture_tx_dma_handle()->State = HAL_DMA_STATE_READY;
+    }
 }
 
 /* ---- безопасные заглушки на периферию будущих этапов (TIM2, SDIO) ----
@@ -99,10 +121,18 @@ void DMA2_Stream6_IRQHandler(void)
     HAL_DMA_IRQHandler(bsp_sdio_dma_handle());
 }
 
+/**
+ * TIM2 — таймер этапа записи (NVIC ещё не включён, обработчик-страховка).
+ * TIM_SR (RM0090 §28.3.3): флаг снимается записью 0 в его бит, запись 1 —
+ * не изменяет. Обнуление всего регистра ("TIM2->SR = 0") стирает и флаги
+ * захвата CC1x, которые появятся на этапе timestamps, поэтому гасим ровно
+ * два штатных источника — Update и CC1 (аналог
+ * __HAL_TIM_CLEAR_IT(htim, TIM_IT_UPDATE | TIM_IT_CC1); своей htim2 у
+ * заглушки нет).
+ */
 void TIM2_IRQHandler(void)
 {
-    /* TIM_SR: флаг снимается записью 0 в соответствующий бит */
-    TIM2->SR = 0u;
+    TIM2->SR = (uint32_t)~(TIM_SR_UIF | TIM_SR_CC1IF);
 }
 
 void SPI1_IRQHandler(void)

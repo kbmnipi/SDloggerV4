@@ -17,6 +17,7 @@
 #include "drv_bmi160.h"
 #include "log_ring.h"
 #include "stm32f4xx_hal.h"
+#include "stm32f4xx_it.h"
 
 /* Пара Stream + Channel обязана быть exactly из матрицы RM0090 (Docs/03 §1):
    неверная пара -> "0 байт передано" без какого-либо флага ошибки. */
@@ -67,9 +68,18 @@ static uint8_t g_tx_dummy[BSP_CAPTURE_MAX_LEN] __attribute__((section(".d1ram"),
 static volatile uint32_t g_capture_errors;
 static volatile uint32_t g_capture_skip_frames;
 
+/* Вычитка в полёте: ставит bsp_capture_start_dma(), снимает
+   DMA2_Stream0_IRQHandler (TC или ошибка). См. bsp_capture.h */
+volatile bool g_dma_busy = false;
+
 static void capture_fail(void)
 {
     g_capture_errors++;
+}
+
+void bsp_capture_error_raise(void)
+{
+    capture_fail();
 }
 
 /**
@@ -198,15 +208,26 @@ void bsp_capture_start_dma(uint8_t *dest_buf, uint16_t len)
     SPI_HandleTypeDef *hspi = drv_bmi160_spi_handle();
     uint8_t cmd = BMI160_CMD_READ_FIFO_DATA;
 
+    /* Reentrancy gate: предыдущая вычитка ещё в полёте (FWM мог подняться
+       раньше, чем главный цикл разобрал пакет). Перезапуск потоков на середине
+       транзакции изуродовал бы и буфер, и окно CS — отклоняем молча. */
+    if (g_dma_busy) {
+        return;
+    }
+
     if (dest_buf == NULL || len == 0u || len > BSP_CAPTURE_MAX_LEN) {
         capture_fail();
         return;
     }
 
+    g_dma_busy = true;
+    g_dma_done = false;
+
     /* 1. Quiesce (Docs/02 §4 п.1) */
     SPI1->CR2 &= (uint32_t)~(SPI_CR2_RXDMAEN | SPI_CR2_TXDMAEN);
     if (!capture_quiesce_stream(&g_hdma_spi1_rx, CAPTURE_RX_DMA_FLAGS) ||
         !capture_quiesce_stream(&g_hdma_spi1_tx, CAPTURE_TX_DMA_FLAGS)) {
+        g_dma_busy = false;
         capture_fail();
         return;
     }
@@ -218,9 +239,18 @@ void bsp_capture_start_dma(uint8_t *dest_buf, uint16_t len)
     if (HAL_SPI_Transmit(hspi, &cmd, 1u, CAPTURE_SPI_TIMEOUT_MS) != HAL_OK) {
         drv_bmi160_cs_write(false);
         capture_flush_spi_rx();
+        g_dma_busy = false;
         capture_fail();
         return;
     }
+
+    /* CRITICAL FIX (M0 hardening): незакрытый pending-бит NVIC или старый
+       TCIF0 потока 0 от прошлой транзакции выстрелили бы прерыванием в первые
+       такты НОВОГО приёма и угнали бы его в bsp_capture_dma_complete() раньше
+       времени. Снимаем и pending, и все флаги потока 0 в LIFCR (запись 1),
+       непосредственно перед стартом потоков. */
+    NVIC_ClearPendingIRQ(DMA2_Stream0_IRQn);
+    DMA2->LIFCR = CAPTURE_RX_DMA_FLAGS;
 
     /* 3. Сначала включаем запрос и запускаем приём, только потом передачу:
        тактовые импульсы не должны появиться раньше готовности RX DMA. */
@@ -228,6 +258,7 @@ void bsp_capture_start_dma(uint8_t *dest_buf, uint16_t len)
     if (HAL_DMA_Start_IT(&g_hdma_spi1_rx, (uint32_t)&SPI1->DR, (uint32_t)dest_buf, len) != HAL_OK) {
         SPI1->CR2 &= (uint32_t)~SPI_CR2_RXDMAEN;
         drv_bmi160_cs_write(false);
+        g_dma_busy = false;
         capture_fail();
         return;
     }
@@ -237,6 +268,7 @@ void bsp_capture_start_dma(uint8_t *dest_buf, uint16_t len)
         SPI1->CR2 &= (uint32_t)~(SPI_CR2_RXDMAEN | SPI_CR2_TXDMAEN);
         (void)capture_quiesce_stream(&g_hdma_spi1_rx, CAPTURE_RX_DMA_FLAGS);
         drv_bmi160_cs_write(false);
+        g_dma_busy = false;
         capture_fail();
         return;
     }
@@ -310,6 +342,16 @@ void bsp_capture_parse_fifo(uint8_t *buf, uint16_t len)
             break; /* заголовка нет в списке: сбой SPI или потеря синхронизации */
         }
     }
+}
+
+DMA_HandleTypeDef *bsp_capture_rx_dma_handle(void)
+{
+    return &g_hdma_spi1_rx;
+}
+
+DMA_HandleTypeDef *bsp_capture_tx_dma_handle(void)
+{
+    return &g_hdma_spi1_tx;
 }
 
 uint32_t bsp_capture_skip_frame_count(void)
