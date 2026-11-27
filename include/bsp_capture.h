@@ -60,6 +60,21 @@ void bsp_capture_start_dma(uint8_t *dest_buf, uint16_t len);
  */
 void bsp_capture_dma_complete(void);
 
+/**
+ * Разбор принятого пакета FIFO_DATA (Docs/02 §4, заголовки BMI160):
+ *   0x84 Regular Accel Frame : 1 + 6 байт {XL,XH,YL,YH,ZL,ZH} -> ring_push_sample
+ *   0x80 Empty / Overread    : конец валидных данных — выход из цикла
+ *   0x40 Skip Frame          : 2 байта, потеря сэмплов (счётчик skip-фреймов)
+ *   0x44 Sensortime Frame    : 4 байта, игнорируем
+ *   0x48 FIFO Config Change  : 2 байта, игнорируем
+ *   любой другой заголовок   : сбой SPI / потеря синхронизации — выход
+ * За предел len чтение не выходит: неполный фрейм в конце пакета отбрасывается.
+ */
+void bsp_capture_parse_fifo(uint8_t *buf, uint16_t len);
+
+/** Число Skip-фреймов (SENSOR_OVR для заголовка блока, Docs/04 §3). */
+uint32_t bsp_capture_skip_frame_count(void);
+
 /** Число сбоев инициализации/запуска вычитки (запрет тихих отказов). */
 uint32_t bsp_capture_error_count(void);
 

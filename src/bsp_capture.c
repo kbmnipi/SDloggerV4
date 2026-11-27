@@ -15,6 +15,7 @@
 #include "bsp_capture.h"
 
 #include "drv_bmi160.h"
+#include "log_ring.h"
 #include "stm32f4xx_hal.h"
 
 /* Пара Stream + Channel обязана быть exactly из матрицы RM0090 (Docs/03 §1):
@@ -49,6 +50,13 @@
 #define CAPTURE_TX_DMA_FLAGS                                                                                   \
     (DMA_FLAG_FEIF3_7 | DMA_FLAG_DMEIF3_7 | DMA_FLAG_TEIF3_7 | DMA_FLAG_HTIF3_7 | DMA_FLAG_TCIF3_7)
 
+/* Заголовки фреймов BMI160 в FIFO (Docs/02_bmi160_ref.md §4) */
+#define BMI160_FRAME_REGULAR_ACCEL 0x84u /* 1 + 6 байт {XL,XH,YL,YH,ZL,ZH} */
+#define BMI160_FRAME_EMPTY 0x80u         /* конец валидных данных в FIFO     */
+#define BMI160_FRAME_SKIP 0x40u          /* 1 + 1 байт счётчика пропусков    */
+#define BMI160_FRAME_SENSORTIME 0x44u    /* 4 байта, игнорируем              */
+#define BMI160_FRAME_FIFO_CONFIG 0x48u   /* 2 байта, игнорируем              */
+
 static DMA_HandleTypeDef g_hdma_spi1_rx;
 static DMA_HandleTypeDef g_hdma_spi1_tx;
 
@@ -57,6 +65,7 @@ static DMA_HandleTypeDef g_hdma_spi1_tx;
 static uint8_t g_tx_dummy[BSP_CAPTURE_MAX_LEN] __attribute__((section(".d1ram"), aligned(4)));
 
 static volatile uint32_t g_capture_errors;
+static volatile uint32_t g_capture_skip_frames;
 
 static void capture_fail(void)
 {
@@ -242,6 +251,70 @@ void bsp_capture_dma_complete(void)
        что окно FIFO_DATA ещё открыто, и следующий командный байт будет
        воспринят как продолжение чтения 0x24. */
     drv_bmi160_cs_write(false);
+}
+
+/**
+ * Разбор принятого пакета FIFO_DATA и складывание сэмплов в кольцо.
+ * Вызывается из главного цикла после g_dma_done (Docs/05 §2 п.1).
+ */
+void bsp_capture_parse_fifo(uint8_t *buf, uint16_t len)
+{
+    uint16_t i = 0u;
+
+    if (buf == NULL || len == 0u) {
+        capture_fail();
+        return;
+    }
+
+    while (i < len) {
+        uint8_t hdr = buf[i];
+
+        if (hdr == BMI160_FRAME_REGULAR_ACCEL) {
+            int16_t x;
+            int16_t y;
+            int16_t z;
+
+            if (((uint32_t)i + 7u) > (uint32_t)len) {
+                break; /* неполный фрейм на конце пакета — ждём следующую вычитку */
+            }
+
+            /* {XL,XH,YL,YH,ZL,ZH} little-endian (Docs/02 §4, Docs/04 §3) */
+            x = (int16_t)((uint16_t)buf[i + 1u] | ((uint16_t)buf[i + 2u] << 8));
+            y = (int16_t)((uint16_t)buf[i + 3u] | ((uint16_t)buf[i + 4u] << 8));
+            z = (int16_t)((uint16_t)buf[i + 5u] | ((uint16_t)buf[i + 6u] << 8));
+
+            if (!ring_push_sample(x, y, z)) {
+                capture_fail();
+                return;
+            }
+            i = (uint16_t)(i + 7u);
+        } else if (hdr == BMI160_FRAME_EMPTY) {
+            break; /* Overread: Further валидных данных в пакете нет */
+        } else if (hdr == BMI160_FRAME_SKIP) {
+            if (((uint32_t)i + 2u) > (uint32_t)len) {
+                break;
+            }
+            g_capture_skip_frames++; /* SENSOR_OVR для заголовка блока */
+            i = (uint16_t)(i + 2u);
+        } else if (hdr == BMI160_FRAME_SENSORTIME) {
+            if (((uint32_t)i + 4u) > (uint32_t)len) {
+                break;
+            }
+            i = (uint16_t)(i + 4u);
+        } else if (hdr == BMI160_FRAME_FIFO_CONFIG) {
+            if (((uint32_t)i + 2u) > (uint32_t)len) {
+                break;
+            }
+            i = (uint16_t)(i + 2u);
+        } else {
+            break; /* заголовка нет в списке: сбой SPI или потеря синхронизации */
+        }
+    }
+}
+
+uint32_t bsp_capture_skip_frame_count(void)
+{
+    return g_capture_skip_frames;
 }
 
 uint32_t bsp_capture_error_count(void)

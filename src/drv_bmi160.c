@@ -21,18 +21,32 @@
 #define BMI160_ADDR_READ 0x80u
 
 /* Регистры FIFO/прерываний (Docs/02_bmi160_ref.md раздел 2) */
+#define BMI160_REG_PMU_STATUS 0x03u
+#define BMI160_REG_ACC_CONF 0x40u
+#define BMI160_REG_ACC_RANGE 0x41u
 #define BMI160_REG_FIFO_CONFIG_0 0x46u
 #define BMI160_REG_FIFO_CONFIG_1 0x47u
 #define BMI160_REG_INT_EN_1 0x51u
 #define BMI160_REG_INT_OUT_CTRL 0x53u
 #define BMI160_REG_INT_MAP_1 0x56u
 
+#define BMI160_CMD_ACC_NORMAL 0x11u /* Accel Normal Mode (Docs/02 §2) */
+
+/* PMU_STATUS (0x03): acc_pmu_status = биты [5:4], Normal == 01 (Docs/02 §2) */
+#define BMI160_PMU_ACC_STATUS_MASK 0x30u
+#define BMI160_PMU_ACC_STATUS_NORMAL 0x10u
+
 /* Значения профиля 1600 Гц / +/-16 g (Docs/02_bmi160_ref.md раздел 3) */
+#define BMI160_ACC_CONF_VALUE 0x1Cu    /* acc_bwp = OSR2 (-3 дБ на 324 Гц), acc_odr = 1600 Гц */
+#define BMI160_ACC_RANGE_VALUE 0x0Cu   /* +/-16 g, 2048 LSB/g (488 мкг/LSB)                 */
 #define BMI160_FIFO_CONFIG_0_VALUE 0x0Eu /* fifo_water_mark = 14 * 4 = 56 байт  */
 #define BMI160_FIFO_CONFIG_1_VALUE 0x50u /* fifo_acc_en | fifo_header_en        */
 #define BMI160_INT_EN_1_VALUE 0x40u      /* int_fwm_en                          */
 #define BMI160_INT_MAP_1_VALUE 0x40u     /* int1_fwm -> INT1                    */
 #define BMI160_INT_OUT_CTRL_VALUE 0x0Au  /* int1_output_en | int1_lvl (HIGH)    */
+
+/* Пауза после CMD = 0x11 до проверки PMU_STATUS (Docs/02 §4 п.5) */
+#define BMI160_ACC_NORMAL_SETTLE_MS 5u
 
 /* Прогрев FIFO после Flush перед началом записи (Docs/02 §4 п.7) */
 #define BMI160_FIFO_FLUSH_SETTLE_MS 50u
@@ -166,6 +180,34 @@ uint8_t drv_bmi160_init_sensor(void)
 
     /* 4. ID датчика: 0xD1, если BMI160 на месте и линия SPI жива */
     return bmi160_read_reg(BMI160_REG_CHIP_ID);
+}
+
+bool drv_bmi160_start_accel(void)
+{
+    uint8_t status;
+
+    /* Docs/02 §4 п.5: Accel Normal Mode, выдержка 5 мс, проверка PMU_STATUS.
+       Без этого шага акселерометр остаётся в SUSPEND: FIFO не заполняется,
+       порог FWM никогда не достигается и INT1 (PB5) не поднимается. */
+    if (!bmi160_write_reg(BMI160_REG_CMD, BMI160_CMD_ACC_NORMAL)) {
+        return false;
+    }
+    HAL_Delay(BMI160_ACC_NORMAL_SETTLE_MS);
+
+    status = bmi160_read_reg(BMI160_REG_PMU_STATUS);
+    if ((status & BMI160_PMU_ACC_STATUS_MASK) != BMI160_PMU_ACC_STATUS_NORMAL) {
+        return false;
+    }
+
+    /* Docs/02 §4 п.6 + §3: профиль 1600 Гц / OSR2 / +/-16 g */
+    if (!bmi160_write_reg(BMI160_REG_ACC_CONF, BMI160_ACC_CONF_VALUE)) {
+        return false;
+    }
+    if (!bmi160_write_reg(BMI160_REG_ACC_RANGE, BMI160_ACC_RANGE_VALUE)) {
+        return false;
+    }
+
+    return true;
 }
 
 bool drv_bmi160_configure_fifo(void)

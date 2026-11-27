@@ -53,6 +53,21 @@ bool drv_bmi160_spi_init(void);
 uint8_t drv_bmi160_init_sensor(void);
 
 /**
+ * Перевести акселерометр в Normal Mode и задать рабочий профиль
+ * (Docs/02_bmi160_ref.md §4 п.5..6, §3):
+ *   CMD (0x7E)        = 0x11 — Accel Normal Mode, выдержка 5 мс
+ *   PMU_STATUS (0x03) — проверка acc_pmu_status == 01
+ *   ACC_CONF (0x40)   = 0x1C — 1600 Гц, фильтр OSR2 (-3 дБ на 324 Гц)
+ *   ACC_RANGE (0x41)  = 0x0C — +/-16 g (2048 LSB/g, 488 мкг/LSB)
+ *
+ * Вызывать ПОСЛЕ drv_bmi160_init_sensor() и ПЕРЕД drv_bmi160_configure_fifo():
+ * без Normal Mode FIFO не заполняется, порог FWM не достигается, INT1 молчит.
+ * true  — акселерометр в Normal Mode и профиль записан;
+ * false — сбой SPI1 или PMU_STATUS не подтвердил Normal Mode.
+ */
+bool drv_bmi160_start_accel(void);
+
+/**
  * Конфигурация FIFO и прерывания по порогу (Docs/02_bmi160_ref.md §3, §4 п.6..7):
  *   FIFO_CONFIG_0 (0x46) = 0x0E — watermark 14 * 4 = 56 байт (8 фреймов, ~5 мс)
  *   FIFO_CONFIG_1 (0x47) = 0x50 — fifo_acc_en + fifo_header_en
