@@ -30,7 +30,6 @@ _estack = ORIGIN(RAM) + LENGTH(RAM);
 
 _Min_Heap_Size = 0x0000;  /* динамическая память (malloc/new) запрещена */
 _Min_Stack_Size = 0x1000; /* MSP 4 KiB — резерв в самом верху D1 SRAM */
-_stack_bottom = _estack - _Min_Stack_Size;
 
 /* Memories definition */
 MEMORY
@@ -188,11 +187,6 @@ SECTIONS
     _eccmram = .;
   } >CCMRAM
 
-  /* ------------------------- границы раскладки ------------------------- */
-  ASSERT(_ed1ram + _Min_Stack_Size <= ORIGIN(RAM) + LENGTH(RAM), "FATAL: D1 Stack collision")
-  ASSERT(_sd1ram >= ORIGIN(RAM) && _ed1ram <= ORIGIN(RAM) + LENGTH(RAM), "FATAL: DMA buffer outside D1 SRAM")
-  ASSERT(_eccmram <= ORIGIN(CCMRAM) + LENGTH(CCMRAM), "FATAL: CCM overflow")
-
   /* Remove information from the compiler libraries */
   /DISCARD/ :
   {
@@ -203,3 +197,12 @@ SECTIONS
 
   .ARM.attributes 0 : { *(.ARM.attributes) }
 }
+
+/* ------------------------- границы раскладки -------------------------
+   ASSERT вне SECTIONS: внутри SECTIONS допускаются только описания
+   выходных секций, командные директивы ld там вне спецификации (GNU ld
+   их отвергает, GCC 7.2.1 терпел). Ссылки на _sd1ram/_ed1ram/_eccmram
+   остаются валидными — символы уже определены выше. */
+ASSERT(_ed1ram + _Min_Stack_Size <= ORIGIN(RAM) + LENGTH(RAM), "FATAL: D1 Stack collision")
+ASSERT(_sd1ram >= ORIGIN(RAM) && _ed1ram <= ORIGIN(RAM) + LENGTH(RAM), "FATAL: DMA buffer outside D1 SRAM")
+ASSERT(_eccmram <= ORIGIN(CCMRAM) + LENGTH(CCMRAM), "FATAL: CCM overflow")

@@ -23,7 +23,6 @@
 #define BMI160_CS_PORT GPIOA
 #define BMI160_CS_PIN GPIO_PIN_4
 #define BMI160_SPI_GPIO_PORT GPIOA
-#define BMI160_SPI_GPIO_PIN GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7
 
 #define BMI160_SPI_TIMEOUT_MS 10u
 
@@ -69,7 +68,7 @@ static void bmi160_write_reg(uint8_t addr, uint8_t value)
     bmi160_cs_high();
 }
 
-void drv_bmi160_spi_init(void)
+bool drv_bmi160_spi_init(void)
 {
     GPIO_InitTypeDef gpio = {0};
 
@@ -110,10 +109,12 @@ void drv_bmi160_spi_init(void)
     g_hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
     g_hspi1.Init.CRCPolynomial = 7u;
     if (HAL_SPI_Init(&g_hspi1) != HAL_OK) {
-        return;
+        return false;
     }
 
     __HAL_SPI_ENABLE(&g_hspi1);
+
+    return true;
 }
 
 uint8_t drv_bmi160_init_sensor(void)

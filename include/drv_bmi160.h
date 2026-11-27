@@ -14,6 +14,7 @@
 #ifndef DRV_BMI160_H
 #define DRV_BMI160_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -25,9 +26,13 @@ extern "C" {
 
 /**
  * Настроить SPI1 и пины датчика: Mode 3 (CPOL=1, CPHA=1), MSB first,
- * 5.25 МГц (APB2 84 МГц / 16), CS (PA4) — push-pull, активно HIGH.
+ * 5.25 МГц (APB2 84 МГц / 16), CS (PA4) — push-pull, активный LOW
+ * (в покое удерживается HIGH).
+ *
+ * true  — SPI1 инициализирован (HAL_OK);
+ * false — HAL_SPI_Init вернул ошибку, вызывающий обязан уйти в ошибку.
  */
-void drv_bmi160_spi_init(void);
+bool drv_bmi160_spi_init(void);
 
 /**
  * Перевести BMI160 в SPI-режим и вернуть содержимое регистра CHIP_ID (0x00).

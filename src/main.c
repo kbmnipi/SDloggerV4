@@ -1,6 +1,14 @@
 /**
  * main.c — этап M0: тактирование 84 МГц + проверка присутствия BMI160.
  *
+ * Порядок инициализации (порядок фиксирован аудитом M0):
+ *   1) bsp_meminit()            — обнуление CCM (секция .ccmram — NOLOAD)
+ *   2) HAL_Init()               — SysTick, приоритет grouped, NVIC
+ *   3) led_init()               — PB2 ДО тактирования: при сбое HSE/PLL код 1
+ *                                должен мигать уже настроенным выходом
+ *   4) system_clock_84mhz_hse() — любой сбой -> fault_blink_code1()
+ *   5) drv_bmi160_spi_init()    — false -> fault_blink_code1()
+ *
  * Индикация (Docs/06_error.md):
  *   CHIP_ID == 0xD1        -> мигаем PB2 с частотой 1 Гц (датчик на месте)
  *   CHIP_ID != 0xD1        -> код 1 (нет ответа от акселерометра): одна вспышка
@@ -19,6 +27,12 @@
 
 #define ERROR_CODE1_BLINK_MS 200u  /* Docs/06_error.md §3: 200 мс горит  */
 #define ERROR_CODE1_PAUSE_MS 2800u /* ... и пауза до конца цикла в 3 с    */
+
+/* Границы секции .ccmram из scripts/STM32F405RGT6_CCM.ld. Секция NOLOAD:
+   startup_stm32f405xx.S обнуляет только _sbss.._ebss в D1 SRAM и до CCM
+   не доходит, поэтому CCM обнуляем явно (Docs/01 §5). */
+extern uint32_t _sccmram;
+extern uint32_t _eccmram;
 
 /**
  * Код ошибки 1 (Docs/06_error.md §3): нет ответа от акселерометра —
@@ -84,15 +98,39 @@ static void led_init(void)
     HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_RESET);
 }
 
+/**
+ * Обнулить CCM (0x10000000): секция .ccmram объявлена NOLOAD и лежит вне
+ * диапазана обнуления startup (_sbss.._ebss — только D1 SRAM). Любое
+ * состояние в CCM обязано стартовать с нуля, а не с мусора после POR.
+ * Сейчас в .ccmram ничего не размещено (диапазон пуст), функция работает
+ * и на последующих этапах (таблица CRC32, состояние FIFO).
+ */
+static void bsp_meminit(void)
+{
+    uint32_t *ccm = &_sccmram;
+
+    while (ccm < &_eccmram) {
+        *ccm++ = 0u;
+    }
+}
+
 int main(void)
 {
     uint8_t chip_id;
 
+    bsp_meminit();
     HAL_Init();
-    system_clock_84mhz_hse();
+
+    /* PB2 настраиваем до тактирования: сбой HSE/PLL должен отмигать код 1
+       уже настроенным выходом (Docs/06_error.md §3) */
     led_init();
 
-    drv_bmi160_spi_init();
+    system_clock_84mhz_hse();
+
+    if (!drv_bmi160_spi_init()) {
+        fault_blink_code1();
+    }
+
     chip_id = drv_bmi160_init_sensor();
 
     if (chip_id != BMI160_CHIP_ID) {

@@ -43,9 +43,10 @@ check_board()
 if not any("-Wl,-T" in f for f in env.get("LINKFLAGS", [])):
     env.Append(LINKFLAGS=["-Wl,-T,%s" % ld_script])
 
-# Реальный скрипт — наш; LIBPATH нужна инструментам анализа размера
-env.Replace(LDSCRIPT_PATH=ld_script)
-env.Prepend(LIBPATH=[os.path.dirname(ld_script)])
+# env.Replace(LDSCRIPT_PATH=...) убран: PlatformIO всё равно подставляет
+# скрипт из LDSCRIPT_PATH в BuildProgram, и единственный работающий способ
+# отключить авто-`-T` — уже имеющийся -Wl,-T в LINKFLAGS (piobuild.py).
+# env.Prepend(LIBPATH=[...]) убран: в каталоге scripts/ нет .a/.lib библиотек.
 
 # ВАЖНО: строку "RAM:" в отчёте ststm32 считает по регулярке
 # SIZEDATAREGEXP="^(?:\.data|\.bss|\.noinit)" (builder/main.py), которая
